@@ -1,0 +1,7 @@
+﻿{
+  "users": [
+    { "username": "ranji", "display_name": "Ranji", "pin": "111111" },
+    { "username": "alice@company.com", "display_name": "Alice", "pin": "248163" },
+    { "username": "bob@company.com", "display_name": "Bob" }
+  ]
+}
