@@ -7,7 +7,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import requests
 import streamlit as st
@@ -194,7 +194,7 @@ def parse_sse_events(body: str) -> list[dict[str, Any]]:
     return events
 
 
-def extract_retry_delay_seconds(response: requests.Response) -> float | None:
+def extract_retry_delay_seconds(response: requests.Response) -> Optional[float]:
     try:
         payload = response.json()
     except ValueError:
@@ -236,20 +236,66 @@ def format_quota_error(response: requests.Response) -> str:
     )
 
 
-def ensure_session(api_base: str, app_name: str, user_id: str, session_id: str) -> str:
-    url = f"{api_base.rstrip('/')}/apps/{app_name}/users/{user_id}/sessions"
-    payload = {"sessionId": session_id}
-
+def _extract_session_id_from_response(response: requests.Response) -> Optional[str]:
     try:
-        response = requests.post(url, json=payload, timeout=20)
-    except requests.RequestException as exc:
-        return f"Session create call failed: {exc}"
+        payload = response.json()
+    except ValueError:
+        return None
 
-    if response.status_code in (200, 201):
-        return "created"
-    if response.status_code == 409:
-        return "exists"
-    return f"failed ({response.status_code}): {response.text[:300]}"
+    if isinstance(payload, dict):
+        for key in ("sessionId", "session_id", "id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        session_obj = payload.get("session")
+        if isinstance(session_obj, dict):
+            for key in ("sessionId", "session_id", "id"):
+                value = session_obj.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+    return None
+
+
+def ensure_session(api_base: str, app_name: str, user_id: str, session_id: str) -> tuple[str, str]:
+    base = api_base.rstrip("/")
+    endpoints = [
+        (
+            "POST sessions (camelCase)",
+            f"{base}/apps/{app_name}/users/{user_id}/sessions",
+            {"sessionId": session_id},
+        ),
+        (
+            "POST sessions (snake_case)",
+            f"{base}/apps/{app_name}/users/{user_id}/sessions",
+            {"session_id": session_id},
+        ),
+        (
+            "POST sessions (id)",
+            f"{base}/apps/{app_name}/users/{user_id}/sessions",
+            {"id": session_id},
+        ),
+    ]
+
+    last_error = ""
+    for label, url, payload in endpoints:
+        try:
+            response = requests.post(url, json=payload, timeout=20)
+        except requests.RequestException as exc:
+            last_error = f"{label}: {exc}"
+            continue
+
+        if response.status_code in (200, 201, 409):
+            server_session_id = _extract_session_id_from_response(response)
+            effective_session_id = server_session_id or session_id
+            if response.status_code in (200, 201):
+                return "created", effective_session_id
+            return "exists", effective_session_id
+
+        # 404 usually means endpoint variant mismatch or app/user path mismatch.
+        last_error = f"{label}: failed ({response.status_code}): {response.text[:300]}"
+
+    return f"failed: {last_error}", session_id
 
 
 def is_session_unavailable_response(response: requests.Response) -> bool:
@@ -328,7 +374,7 @@ def run_agent(
         if session_attempt == 1:
             active_session_id = "s_" + uuid.uuid4().hex[:10]
 
-        session_status = ensure_session(base, app_name, user_id, active_session_id)
+        session_status, active_session_id = ensure_session(base, app_name, user_id, active_session_id)
         if session_status.startswith("failed"):
             last_error = f"Could not prepare session {active_session_id}: {session_status}"
             continue
@@ -339,6 +385,24 @@ def run_agent(
                 try:
                     response = requests.post(url, json=payload, timeout=180)
                     if is_session_unavailable_response(response):
+                        # Retry once after forcing session re-creation for this same ID.
+                        recreate_status, recreated_session_id = ensure_session(
+                            base, app_name, user_id, active_session_id
+                        )
+                        if not recreate_status.startswith("failed"):
+                            payload_retry = dict(payload)
+                            payload_retry["sessionId"] = recreated_session_id
+                            payload_retry["session_id"] = recreated_session_id
+                            response_retry = requests.post(url, json=payload_retry, timeout=180)
+                            if not is_session_unavailable_response(response_retry):
+                                response_retry.raise_for_status()
+                                events = (
+                                    parse_sse_events(response_retry.text)
+                                    if is_sse
+                                    else response_retry.json()
+                                )
+                                return extract_text(events), events, label, recreated_session_id
+
                         last_error = f"{label} -> {response.status_code} ({response.text[:200]})"
                         should_rotate_session = True
                         break
