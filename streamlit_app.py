@@ -252,87 +252,124 @@ def ensure_session(api_base: str, app_name: str, user_id: str, session_id: str) 
     return f"failed ({response.status_code}): {response.text[:300]}"
 
 
-def run_agent(api_base: str, app_name: str, user_id: str, session_id: str, prompt: str) -> tuple[str, Any, str]:
-    base = api_base.rstrip("/")
-    session_status = ensure_session(base, app_name, user_id, session_id)
-    if session_status.startswith("failed"):
-        raise RuntimeError(f"Could not prepare session {session_id}: {session_status}")
+def is_session_unavailable_response(response: requests.Response) -> bool:
+    if response.status_code not in (400, 404):
+        return False
 
-    attempts = [
-        (
-            "POST /run (camelCase)",
-            f"{base}/run",
-            {
-                "appName": app_name,
-                "userId": user_id,
-                "sessionId": session_id,
-                "newMessage": {"role": "user", "parts": [{"text": prompt}]},
-            },
-            False,
-        ),
-        (
-            "POST /run (snake_case)",
-            f"{base}/run",
-            {
-                "app_name": app_name,
-                "user_id": user_id,
-                "session_id": session_id,
-                "new_message": {"role": "user", "parts": [{"text": prompt}]},
-            },
-            False,
-        ),
-        (
-            "POST /run_sse (camelCase)",
-            f"{base}/run_sse",
-            {
-                "appName": app_name,
-                "userId": user_id,
-                "sessionId": session_id,
-                "newMessage": {"role": "user", "parts": [{"text": prompt}]},
-                "streaming": False,
-            },
-            True,
-        ),
-        (
-            "POST /run_sse (snake_case)",
-            f"{base}/run_sse",
-            {
-                "app_name": app_name,
-                "user_id": user_id,
-                "session_id": session_id,
-                "new_message": {"role": "user", "parts": [{"text": prompt}]},
-                "streaming": False,
-            },
-            True,
-        ),
+    text = response.text.lower()
+    patterns = [
+        "session not found",
+        "session not available",
+        "session unavailable",
+        "session does not exist",
+        "invalid session",
     ]
+    return any(pattern in text for pattern in patterns)
+
+
+def run_agent(
+    api_base: str, app_name: str, user_id: str, session_id: str, prompt: str
+) -> tuple[str, Any, str, str]:
+    base = api_base.rstrip("/")
+    active_session_id = session_id
+
+    def build_attempts(current_session_id: str) -> list[tuple[str, str, dict[str, Any], bool]]:
+        return [
+            (
+                "POST /run (camelCase)",
+                f"{base}/run",
+                {
+                    "appName": app_name,
+                    "userId": user_id,
+                    "sessionId": current_session_id,
+                    "newMessage": {"role": "user", "parts": [{"text": prompt}]},
+                },
+                False,
+            ),
+            (
+                "POST /run (snake_case)",
+                f"{base}/run",
+                {
+                    "app_name": app_name,
+                    "user_id": user_id,
+                    "session_id": current_session_id,
+                    "new_message": {"role": "user", "parts": [{"text": prompt}]},
+                },
+                False,
+            ),
+            (
+                "POST /run_sse (camelCase)",
+                f"{base}/run_sse",
+                {
+                    "appName": app_name,
+                    "userId": user_id,
+                    "sessionId": current_session_id,
+                    "newMessage": {"role": "user", "parts": [{"text": prompt}]},
+                    "streaming": False,
+                },
+                True,
+            ),
+            (
+                "POST /run_sse (snake_case)",
+                f"{base}/run_sse",
+                {
+                    "app_name": app_name,
+                    "user_id": user_id,
+                    "session_id": current_session_id,
+                    "new_message": {"role": "user", "parts": [{"text": prompt}]},
+                    "streaming": False,
+                },
+                True,
+            ),
+        ]
 
     last_error = "No compatible ADK run endpoint found."
-    for label, url, payload, is_sse in attempts:
-        for retry in range(2):
-            try:
-                response = requests.post(url, json=payload, timeout=180)
-                if response.status_code == 404:
-                    last_error = f"{label} -> 404 ({response.text[:200]})"
+    for session_attempt in range(2):
+        if session_attempt == 1:
+            active_session_id = "s_" + uuid.uuid4().hex[:10]
+
+        session_status = ensure_session(base, app_name, user_id, active_session_id)
+        if session_status.startswith("failed"):
+            last_error = f"Could not prepare session {active_session_id}: {session_status}"
+            continue
+
+        should_rotate_session = False
+        for label, url, payload, is_sse in build_attempts(active_session_id):
+            for retry in range(2):
+                try:
+                    response = requests.post(url, json=payload, timeout=180)
+                    if is_session_unavailable_response(response):
+                        last_error = f"{label} -> {response.status_code} ({response.text[:200]})"
+                        should_rotate_session = True
+                        break
+
+                    if response.status_code == 404:
+                        last_error = f"{label} -> 404 ({response.text[:200]})"
+                        break
+
+                    if response.status_code == 429:
+                        if retry == 0:
+                            retry_secs = extract_retry_delay_seconds(response)
+                            if retry_secs is not None:
+                                time.sleep(min(retry_secs, 10.0))
+                                continue
+                        raise RuntimeError(format_quota_error(response))
+
+                    response.raise_for_status()
+                    events = parse_sse_events(response.text) if is_sse else response.json()
+                    return extract_text(events), events, label, active_session_id
+                except requests.RequestException as exc:
+                    last_error = f"{label} -> {exc}"
+                    break
+                except ValueError as exc:
+                    last_error = f"{label} -> Invalid JSON response: {exc}"
                     break
 
-                if response.status_code == 429:
-                    if retry == 0:
-                        retry_secs = extract_retry_delay_seconds(response)
-                        if retry_secs is not None:
-                            time.sleep(min(retry_secs, 10.0))
-                            continue
-                    raise RuntimeError(format_quota_error(response))
+            if should_rotate_session:
+                break
 
-                response.raise_for_status()
-                events = parse_sse_events(response.text) if is_sse else response.json()
-                return extract_text(events), events, label
-            except requests.RequestException as exc:
-                last_error = f"{label} -> {exc}"
-                break
-            except ValueError as exc:
-                last_error = f"{label} -> Invalid JSON response: {exc}"
-                break
+        if not should_rotate_session:
+            break
 
     raise RuntimeError(last_error)
 
@@ -348,6 +385,7 @@ def init_state() -> None:
     st.session_state.setdefault("auth_fail_count", 0)
     st.session_state.setdefault("last_events", [])
     st.session_state.setdefault("last_route", "")
+    st.session_state.setdefault("session_recovered", False)
 
 
 def login_user(normalized_user: str, display_name: str) -> None:
@@ -374,6 +412,7 @@ def logout_user() -> None:
     st.session_state.session_id = ""
     st.session_state.last_events = []
     st.session_state.last_route = ""
+    st.session_state.session_recovered = False
 
 
 def render_login(allowed_users: dict[str, dict[str, str]]) -> None:
@@ -424,6 +463,7 @@ def render_sidebar(server_ok: bool, server_status: str) -> None:
         col1, col2 = st.columns(2)
         if col1.button("New Session", use_container_width=True):
             st.session_state.session_id = "s_" + uuid.uuid4().hex[:10]
+            st.session_state.session_recovered = False
             save_user_state(st.session_state.username, st.session_state.session_id, st.session_state.messages)
 
         if col2.button("Clear Chat", use_container_width=True):
@@ -442,6 +482,8 @@ def render_sidebar(server_ok: bool, server_status: str) -> None:
 def render_chat() -> None:
     st.title("Chat")
     st.caption("Simple and functional interface.")
+    if st.session_state.session_recovered:
+        st.info("Previous session was unavailable. A new session was created automatically.")
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -465,17 +507,21 @@ def render_chat() -> None:
         route_used = "none"
     else:
         try:
-            reply, events, route_used = run_agent(
+            prior_session_id = st.session_state.session_id
+            reply, events, route_used, active_session_id = run_agent(
                 st.session_state.api_base,
                 st.session_state.app_name,
                 st.session_state.username,
-                st.session_state.session_id,
+                prior_session_id,
                 prompt,
             )
+            st.session_state.session_id = active_session_id
+            st.session_state.session_recovered = active_session_id != prior_session_id
         except Exception as exc:
             reply = f"Request failed: {exc}"
             events = []
             route_used = "failed"
+            st.session_state.session_recovered = False
 
     assistant_message = {"role": "assistant", "content": reply, "timestamp": now_iso()}
     st.session_state.messages.append(assistant_message)
